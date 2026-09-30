@@ -1,21 +1,182 @@
-# https://docs.github.com/en/actions/use-cases-and-examples/deploying/installing-an-apple-certificate-on-macos-runners-for-xcode-development
+# Put this file at .github/workflows/build.yml in your fork of ColdGrub1384/Pyto.
+# First build configuration: checked locally, not yet run on a macOS runner.
+name: Build Pyto for TrollStore
 
-name: build
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pyto-trollstore
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      COCOAPODS_DISABLE_STATS: "true"
+
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - name: Checkout your Pyto fork
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Select Python 3.10
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
-          allow-prereleases: true
-      - run: pip install --upgrade pip
-      - run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
-      - run: ./setup.sh
-      - run: xcodebuild -workspace Pyto.xcworkspace -scheme Pyto -configuration Release
+
+      - name: Prepare build environment
+        run: |
+          mkdir -p output
+          test -f Pyto.xcodeproj/project.pbxproj
+          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+          python3 --version
+          pod --version
+          git rev-parse HEAD > output/source-commit.txt
+          cat > "$RUNNER_TEMP/pyto-constraints.txt" <<'EOF'
+          Cython==0.29.36
+          numpy==1.23.5
+          setuptools==59.8.0
+          wheel==0.41.3
+          pip==23.3.2
+          sphinx==5.3.0
+          sphinx-rtd-theme==1.3.0
+          EOF
+          export PIP_CONSTRAINT="$RUNNER_TEMP/pyto-constraints.txt"
+          echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
+          python3 -m pip install pip setuptools wheel Cython numpy
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.gitmodules')
+          p.write_text(p.read_text().replace('http://github.com/', 'https://github.com/'))
+          source = Path('Pyto/Model/SceneDelegate.swift').read_text()
+          if '#if VPP || SCREENSHOTS' not in source:
+              raise SystemExit('Expected VPP branch not found. The source layout has changed.')
+          setup = Path('setup.sh')
+          setup.write_text(setup.read_text().replace(
+              'tar -xzvf Python-3.10-iOS-support.b1.tar.gz',
+              'tar -xzvf ../Python-3.10-iOS-support.b1.tar.gz'))
+          # The scientific libraries are still built. Rebuilding their offline
+          # manuals installs a large documentation/TeX toolchain; skip that part.
+          docs = Path('Extensions/Dependencies/tools/build-docs.sh')
+          if not docs.is_file():
+              raise SystemExit('Expected documentation build script not found.')
+          docs.write_text('#!/bin/bash\necho "Skipping third-party offline manual generation"\n')
+          PY
+
+      - name: Fetch source dependencies
+        run: |
+          set -o pipefail
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1 --jobs 4 2>&1 | tee output/submodules.log
+          git submodule status --recursive >> output/source-commit.txt
+
+      - name: Build Python and scientific dependencies
+        run: |
+          set -o pipefail
+          bash ./setup.sh 2>&1 | tee output/dependencies.log
+          test -f python3_ios/Python3_ios/libPython3.10.a
+          test -f Pods/Manifest.lock
+
+      - name: Build the iPhone app with VPP enabled
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace Pyto.xcworkspace \
+            -scheme Pyto \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/PytoDerivedData" \
+            -jobs 3 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            ENABLE_BITCODE=NO \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            'OTHER_SWIFT_FLAGS=$(inherited) -D VPP' \
+            build 2>&1 | tee output/xcodebuild.log
+
+      - name: Package IPA and preserve app entitlements
+        run: |
+          APP_PATH="$RUNNER_TEMP/PytoDerivedData/Build/Products/Release-iphoneos/Pyto.app"
+          test -d "$APP_PATH"
+          mkdir -p "$RUNNER_TEMP/pyto-package/Payload"
+          ditto "$APP_PATH" "$RUNNER_TEMP/pyto-package/Payload/Pyto.app"
+          python3 - <<'PY'
+          import os
+          import plistlib
+          import subprocess
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          app = Path(os.environ['RUNNER_TEMP']) / 'pyto-package/Payload/Pyto.app'
+          entitlement_files = {
+              'Pyto.app': 'Pyto/Pyto.entitlements',
+              'Pyto Intents.appex': 'Pyto Intents/Pyto Intents.entitlements',
+              'Intents UI.appex': 'Intents UI/Intents UIDebug.entitlements',
+              'WidgetExtension.appex': 'WidgetExtension.entitlements',
+              'SwiftUI Preview.appex': 'SwiftUI Preview/SwiftUI Preview.entitlements',
+              'SwiftUI Preview.app': 'SwiftUI Preview/SwiftUI Preview.entitlements',
+          }
+          # Ad-hoc signatures need no Apple account. They carry the original
+          # entitlements into the IPA so TrollStore can preserve app groups.
+          bundles = [p for p in app.rglob('*')
+                     if not p.is_symlink() and
+                     ((p.is_dir() and p.suffix in {'.framework', '.appex', '.app'})
+                      or (p.is_file() and p.suffix == '.dylib'))]
+          bundles.sort(key=lambda p: len(p.parts), reverse=True)
+          for bundle in bundles + [app]:
+              command = ['/usr/bin/codesign', '--force', '--sign', '-', '--timestamp=none']
+              source = entitlement_files.get(bundle.name)
+              if source:
+                  entitlement = root / source
+                  if not entitlement.is_file():
+                      raise SystemExit(f'Missing entitlement file: {source}')
+                  command += ['--entitlements', str(entitlement)]
+              subprocess.run(command + [str(bundle)], check=True)
+          subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+          with (app / 'Info.plist').open('rb') as handle:
+              info = plistlib.load(handle)
+          print('App version:', info.get('CFBundleShortVersionString'))
+          print('Minimum iOS:', info.get('MinimumOSVersion'))
+          PY
+          cd "$RUNNER_TEMP/pyto-package"
+          /usr/bin/zip -q -r -y "$GITHUB_WORKSPACE/output/Pyto-TrollStore.ipa" Payload
+          cd "$GITHUB_WORKSPACE/output"
+          shasum -a 256 Pyto-TrollStore.ipa > Pyto-TrollStore.sha256
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: Pyto-TrollStore
+          path: |
+            output/Pyto-TrollStore.ipa
+            output/Pyto-TrollStore.sha256
+            output/source-commit.txt
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Pyto-build-logs
+          path: |
+            output/*.log
+            output/source-commit.txt
+          retention-days: 3
+          if-no-files-found: ignore
