@@ -1,5 +1,6 @@
 # Put this file at .github/workflows/build.yml in your fork of ColdGrub1384/Pyto.
-# First build configuration: checked locally, not yet run on a macOS runner.
+# Revision 2: fixes the missing ssh_cmd.xcframework reported by the first run.
+# Download and configuration checked locally; full macOS build not yet verified.
 name: Build Pyto for TrollStore
 
 on:
@@ -82,12 +83,52 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4 2>&1 | tee output/submodules.log
           git submodule status --recursive >> output/source-commit.txt
 
+      - name: Fetch missing SSH framework
+        run: |
+          # setup.sh fetches the other ios_system frameworks but omits ssh_cmd.
+          # Keep this at the same v3.0.0 release as those dependencies.
+          SSH_ARCHIVE="$RUNNER_TEMP/ssh_cmd.xcframework.zip"
+          curl --fail --location --retry 3 --connect-timeout 30 --max-time 300 \
+            https://github.com/holzschu/ios_system/releases/download/v3.0.0/ssh_cmd.xcframework.zip \
+            --output "$SSH_ARCHIVE"
+          echo "9b57b07d4e552f30f7127843860defe4e8edbad8c0b5f2e4c7e99399713b87e6  $SSH_ARCHIVE" | shasum -a 256 --check
+          mkdir -p Extensions/Dependencies/ios_system
+          unzip -q -o "$SSH_ARCHIVE" -d Extensions/Dependencies/ios_system
+          test -f Extensions/Dependencies/ios_system/ssh_cmd.xcframework/ios-arm64/ssh_cmd.framework/ssh_cmd
+
       - name: Build Python and scientific dependencies
         run: |
           set -o pipefail
           bash ./setup.sh 2>&1 | tee output/dependencies.log
           test -f python3_ios/Python3_ios/libPython3.10.a
           test -f Pods/Manifest.lock
+
+      - name: Check required command frameworks
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+
+          base = Path('Extensions/Dependencies/ios_system')
+          names = ['awk', 'curl_ios', 'files', 'shell', 'tar', 'text', 'network_ios', 'ssh_cmd']
+          for name in names:
+              framework = base / (name + '.xcframework')
+              with (framework / 'Info.plist').open('rb') as handle:
+                  info = plistlib.load(handle)
+              candidates = [item for item in info['AvailableLibraries']
+                            if item['SupportedPlatform'] == 'ios'
+                            and not item.get('SupportedPlatformVariant')
+                            and 'arm64' in item['SupportedArchitectures']]
+              if not candidates:
+                  raise SystemExit(f'No iPhone arm64 slice in {framework}')
+              item = candidates[0]
+              bundle = framework / item['LibraryIdentifier'] / item['LibraryPath']
+              with (bundle / 'Info.plist').open('rb') as handle:
+                  bundle_info = plistlib.load(handle)
+              if not (bundle / bundle_info['CFBundleExecutable']).is_file():
+                  raise SystemExit(f'Missing framework binary in {bundle}')
+              print(f'OK: {name} (iPhone arm64)')
+          PY
 
       - name: Build the iPhone app with VPP enabled
         run: |
