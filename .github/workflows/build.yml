@@ -1,6 +1,6 @@
 # Put this file at .github/workflows/build.yml in your fork of ColdGrub1384/Pyto.
-# Revision 2: fixes the missing ssh_cmd.xcframework reported by the first run.
-# Download and configuration checked locally; full macOS build not yet verified.
+# Revision 3: download and verify all command frameworks before compiling.
+# All eight official archives checked locally; full macOS build not yet verified.
 name: Build Pyto for TrollStore
 
 on:
@@ -65,9 +65,29 @@ jobs:
           if '#if VPP || SCREENSHOTS' not in source:
               raise SystemExit('Expected VPP branch not found. The source layout has changed.')
           setup = Path('setup.sh')
-          setup.write_text(setup.read_text().replace(
+          setup_text = setup.read_text().replace(
               'tar -xzvf Python-3.10-iOS-support.b1.tar.gz',
-              'tar -xzvf ../Python-3.10-iOS-support.b1.tar.gz'))
+              'tar -xzvf ../Python-3.10-iOS-support.b1.tar.gz')
+          # The workflow prepares the complete framework set before setup.sh.
+          # Remove its unchecked, duplicate downloads so it cannot overwrite them.
+          start = setup_text.find('# ios_system\n')
+          end = setup_text.find('pushd Extensions/Dependencies/libssh2', start)
+          if start < 0 or end < start:
+              raise SystemExit('Expected ios_system download section not found.')
+          setup_text = (setup_text[:start]
+                        + '# ios_system frameworks are prepared by the workflow.\n\n'
+                        + setup_text[end:])
+          # Stop promptly if any remaining top-level download/unpack fails.
+          lines = []
+          for line in setup_text.splitlines():
+              if line.startswith('curl '):
+                  line = line.replace('curl ', 'curl --fail --retry 3 --retry-delay 2 --connect-timeout 30 ', 1) + ' || exit 1'
+              elif line.startswith('unzip '):
+                  line = line.replace('unzip ', 'unzip -q -o ', 1) + ' || exit 1'
+              elif line.startswith('tar -xzvf ') or line == 'pod install':
+                  line += ' || exit 1'
+              lines.append(line)
+          setup.write_text('\n'.join(lines) + '\n')
           # The scientific libraries are still built. Rebuilding their offline
           # manuals installs a large documentation/TeX toolchain; skip that part.
           docs = Path('Extensions/Dependencies/tools/build-docs.sh')
@@ -83,18 +103,97 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4 2>&1 | tee output/submodules.log
           git submodule status --recursive >> output/source-commit.txt
 
-      - name: Fetch missing SSH framework
+      - name: Download and verify all command frameworks
         run: |
-          # setup.sh fetches the other ios_system frameworks but omits ssh_cmd.
-          # Keep this at the same v3.0.0 release as those dependencies.
-          SSH_ARCHIVE="$RUNNER_TEMP/ssh_cmd.xcframework.zip"
-          curl --fail --location --retry 3 --connect-timeout 30 --max-time 300 \
-            https://github.com/holzschu/ios_system/releases/download/v3.0.0/ssh_cmd.xcframework.zip \
-            --output "$SSH_ARCHIVE"
-          echo "9b57b07d4e552f30f7127843860defe4e8edbad8c0b5f2e4c7e99399713b87e6  $SSH_ARCHIVE" | shasum -a 256 --check
-          mkdir -p Extensions/Dependencies/ios_system
-          unzip -q -o "$SSH_ARCHIVE" -d Extensions/Dependencies/ios_system
-          test -f Extensions/Dependencies/ios_system/ssh_cmd.xcframework/ios-arm64/ssh_cmd.framework/ssh_cmd
+          set -o pipefail
+          cat > "$RUNNER_TEMP/pyto-command-frameworks.py" <<'PY'
+          import hashlib
+          import os
+          import plistlib
+          import subprocess
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          base = Path(os.environ['GITHUB_WORKSPACE']) / 'Extensions/Dependencies/ios_system'
+          archives = Path(os.environ['RUNNER_TEMP']) / 'pyto-framework-archives'
+          hashes = {
+              'awk': 'd0ac9d6d98b8129c8b392a337c7d5e8289cdbdf9be3d5e6a5376891489c520a1',
+              'curl_ios': '8281e5b74ce6c4f6132415172cc806d097ba283048eb0882d14e1485ec49dade',
+              'files': '8296849e51ee9ddbb3796a1a87bb3a411cfdabd827d48bd5713fbfb3333d9862',
+              'shell': '846651a205e9d781f1f71d3124b5cfca3edfa7722a6c11977ab9c6c73049a810',
+              'tar': 'f5769e81aa15730cc041a7d95a8a8b549888633b2649b4f0adc20b437c25fb4d',
+              'text': 'bd594ed4bbc67cf9c9393e360a35a35dd9674a4be0d460622221935ea7c76eb2',
+              'network_ios': '18e96112ae86ec39390487d850e7732d88e446f9f233b2792d633933d4606d46',
+              'ssh_cmd': '9b57b07d4e552f30f7127843860defe4e8edbad8c0b5f2e4c7e99399713b87e6',
+          }
+
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+          def validate(name):
+              framework = base / (name + '.xcframework')
+              with (framework / 'Info.plist').open('rb') as handle:
+                  info = plistlib.load(handle)
+              candidates = [item for item in info['AvailableLibraries']
+                            if item['SupportedPlatform'] == 'ios'
+                            and not item.get('SupportedPlatformVariant')
+                            and 'arm64' in item['SupportedArchitectures']]
+              if not candidates:
+                  raise ValueError(f'No iPhone arm64 slice in {framework}')
+              item = candidates[0]
+              bundle = framework / item['LibraryIdentifier'] / item['LibraryPath']
+              with (bundle / 'Info.plist').open('rb') as handle:
+                  bundle_info = plistlib.load(handle)
+              binary = bundle / bundle_info['CFBundleExecutable']
+              if not binary.is_file() or binary.stat().st_size == 0:
+                  raise ValueError(f'Missing or empty framework binary: {binary}')
+
+          if '--check' not in sys.argv:
+              base.mkdir(parents=True, exist_ok=True)
+              archives.mkdir(parents=True, exist_ok=True)
+              for name, expected in hashes.items():
+                  archive = archives / (name + '.xcframework.zip')
+                  release = ('https://github.com/holzschu/network_ios/releases/download/v0.2/'
+                             if name == 'network_ios' else
+                             'https://github.com/holzschu/ios_system/releases/download/v3.0.0/')
+                  url = release + archive.name
+                  for attempt in range(1, 4):
+                      try:
+                          if digest(archive) != expected:
+                              partial = archive.with_suffix('.zip.part')
+                              print(f'Downloading {name}, attempt {attempt}/3', flush=True)
+                              subprocess.run(['curl', '--fail', '--location', '--retry', '2',
+                                              '--retry-delay', '2', '--connect-timeout', '30',
+                                              '--max-time', '300', '--output', str(partial), url], check=True)
+                              if digest(partial) != expected:
+                                  raise ValueError(f'SHA256 mismatch for {name}')
+                              partial.replace(archive)
+                          with zipfile.ZipFile(archive) as package:
+                              corrupt = package.testzip()
+                              if corrupt:
+                                  raise ValueError(f'Corrupt archive entry: {corrupt}')
+                          subprocess.run(['unzip', '-q', '-o', str(archive), '-d', str(base)], check=True)
+                          validate(name)
+                          print(f'Installed and verified: {name} (iPhone arm64)', flush=True)
+                          break
+                      except (OSError, ValueError, zipfile.BadZipFile, subprocess.CalledProcessError) as error:
+                          print(f'{name}: {error}', file=sys.stderr, flush=True)
+                          archive.unlink(missing_ok=True)
+                          if attempt == 3:
+                              raise SystemExit(f'Cannot prepare {name}; stopping before dependency compilation.')
+
+          failures = []
+          for name in hashes:
+              try:
+                  validate(name)
+                  print(f'OK: {name} (iPhone arm64)', flush=True)
+              except (OSError, ValueError, KeyError) as error:
+                  failures.append(f'{name}: {error}')
+          if failures:
+              raise SystemExit('\n'.join(failures))
+          PY
+          python3 -u "$RUNNER_TEMP/pyto-command-frameworks.py" 2>&1 | tee output/frameworks.log
 
       - name: Build Python and scientific dependencies
         run: |
@@ -105,30 +204,8 @@ jobs:
 
       - name: Check required command frameworks
         run: |
-          python3 - <<'PY'
-          import plistlib
-          from pathlib import Path
-
-          base = Path('Extensions/Dependencies/ios_system')
-          names = ['awk', 'curl_ios', 'files', 'shell', 'tar', 'text', 'network_ios', 'ssh_cmd']
-          for name in names:
-              framework = base / (name + '.xcframework')
-              with (framework / 'Info.plist').open('rb') as handle:
-                  info = plistlib.load(handle)
-              candidates = [item for item in info['AvailableLibraries']
-                            if item['SupportedPlatform'] == 'ios'
-                            and not item.get('SupportedPlatformVariant')
-                            and 'arm64' in item['SupportedArchitectures']]
-              if not candidates:
-                  raise SystemExit(f'No iPhone arm64 slice in {framework}')
-              item = candidates[0]
-              bundle = framework / item['LibraryIdentifier'] / item['LibraryPath']
-              with (bundle / 'Info.plist').open('rb') as handle:
-                  bundle_info = plistlib.load(handle)
-              if not (bundle / bundle_info['CFBundleExecutable']).is_file():
-                  raise SystemExit(f'Missing framework binary in {bundle}')
-              print(f'OK: {name} (iPhone arm64)')
-          PY
+          set -o pipefail
+          python3 -u "$RUNNER_TEMP/pyto-command-frameworks.py" --check 2>&1 | tee -a output/frameworks.log
 
       - name: Build the iPhone app with VPP enabled
         run: |
